@@ -1,53 +1,47 @@
-# Design — Medical Content Review (MLR) Workflow
+# Design — World Cup 2026 Toronto Itinerary & Fan Guide Verifier
 
 > Verified against `strands_agents==1.42.0` / `strands_agents_tools==0.8.0` in `.venv`. Every class,
-> hook event, and tool named below exists in the pinned deps or in AWS managed-service docs. See
-> `steering/tech.md`.
+> hook event, and tool named below exists in the pinned deps. See `steering/tech.md`.
 
 ## 1. Overview
 
-A **Strands `Graph`** (deterministic DAG) ingests two PDFs, segments the content into batches, fans
-each batch out to three independent reviewer agents in parallel, joins their findings, and synthesizes
-a single per-claim report. A **read-only `HookProvider`** and **Bedrock Guardrails** form the safety
-boundary; **OpenTelemetry via `StrandsTelemetry`** provides the audit trail. The system is
-decision-support only — it produces verdicts and citations, never publishes.
+A **Strands `Graph`** (deterministic DAG) ingests the draft travel itinerary and bookings document, segments the content into individual activities, fans each activity out to three independent reviewer agents in parallel, joins their findings, and synthesizes a single consolidated trip safety report. A **read-only `HookProvider`** forms the safety boundary; **OpenTelemetry Console Exporter** provides stdout trace logs for debugging.
 
 ### Why `GraphBuilder`, not "agents-as-tools" (design decision, satisfies Req 3)
 
-The original spec modeled the reviewers as tools the orchestrator "calls in parallel." That makes
-parallelism a *model decision* — non-deterministic and unauditable, and Req 3.1 demands the three
-reviewers *always* run concurrently. A **`Graph`** encodes that as structure: three reviewer nodes
-with no edges between them (so the runtime executes them in parallel) converging on a join node.
-Determinism, traceable topology, and per-node retry come for free. Agents-as-tools is reserved for
-*optional* specialists, which we don't have here.
+We use a **`Graph`** to enforce that all three review dimensions (editorial guidelines, private logistics, and public stadium policies) are executed concurrently and independently. Encoding this as structure ensures that if one reviewer node fails, we can recover gracefully and report warnings for that dimension, satisfying Requirement 3.5 without crashing the entire trip verification run.
+
+---
 
 ## 2. Architecture
 
 ```mermaid
 graph TD
     subgraph Ingestion (deterministic tools, not agents)
-        Content[Content PDF] --> OCR[process_pdf]
-        Ref[Reference PDF] --> OCR
-        OCR --> Seg[batch_content → claims + batch_ids]
+        Draft[Draft Itinerary PDF] --> OCR[process_pdf]
+        Bookings[Bookings PDF] --> OCR
+        OCR --> Seg[batch_content → ItineraryActivity list]
     end
 
     Seg --> Fan{{Graph: per-batch fan-out}}
 
     subgraph Parallel reviewer nodes (Strands Graph)
-        Fan --> Edit[Editorial Agent<br/>cheap model tier]
-        Fan --> Internal[Internal Evidence Agent<br/>tools: query_s3_documents, retrieve]
-        Fan --> External[External Evidence Agent<br/>tools: mcp_client → PubMed/openFDA]
+        Fan --> Edit[Editorial Agent<br/>gemini-2.5-flash]
+        Fan --> Logistics[Logistics Agent<br/>tools: query_google_drive]
+        Fan --> Rules[Rules & Schedule Agent<br/>tools: mcp_client → Web Search]
     end
 
     Edit --> Join[Join / Synthesis node]
-    Internal --> Join
-    External --> Join
-    Join --> Report[Final MLR Report]
+    Logistics --> Join
+    Rules --> Join
+    Join --> Report[Final Trip Safety Report]
 
-    Internal -. read-only IAM + ReadOnlyGuard hook .-> S3[(Private S3 evidence)]
-    External -. read-only .-> MCP[(Lambda/Gateway MCP: PubMed, openFDA)]
-    Join -. OTEL spans .-> Obs[(AgentCore Observability / CloudWatch)]
+    Logistics -. read-only simulated drive + ReadOnlyGuard hook .-> GDrive[(Google Drive Booking confirmations)]
+    Rules -. read-only .-> MCP[(Web Search MCP: Match schedule & BMO Field guidelines)]
+    Join -. OTEL spans .-> Obs[(Console stdout trace logs)]
 ```
+
+---
 
 ## 3. Components & interfaces
 
@@ -56,7 +50,7 @@ graph TD
 ```python
 @tool
 def process_pdf(file_path: str) -> dict:
-    """OCR a PDF to structured Markdown blocks with page numbers and figure alt-text.
+    """OCR an itinerary or bookings PDF to structured Markdown blocks with page numbers.
 
     Returns: {"blocks": [{"page": int, "markdown": str, "kind": "text|table|figure"}], "source": str}
     Raises a typed IngestionError (Req 1.3) on unreadable/encrypted/non-PDF input.
@@ -64,66 +58,64 @@ def process_pdf(file_path: str) -> dict:
 
 @tool
 def batch_content(blocks: list[dict], max_tokens: int = 4000) -> list["Batch"]:
-    """Segment content blocks into token-bounded batches; extract atomic claims (Req 2)."""
+    """Segment itinerary blocks into token-bounded batches; extract atomic activities (Req 2)."""
 
 @tool
-def query_s3_documents(bucket: str, key: str) -> dict:
-    """Read-only fetch of an internal evidence object from S3. Returns content + the citable key.
-    Read-only by design: the IAM role grants s3:GetObject only (Req 4.3)."""
+def query_google_drive(file_id: str) -> dict:
+    """Read-only fetch of a travel booking reservation (flight, hotel, match ticket) from Google Drive.
+    
+    Returns content + the citable key. For local testing, this reads from a local directory mock 
+    simulating Google Drive folder records.
+    """
 ```
-
-> **PE note:** OCR and segmentation are *deterministic* — make them tools, not agents. Spending a
-> reasoning model on "split this text into 4k-token chunks" burns tokens and adds non-determinism.
-> Reserve the LLM for judgment (substantiation), not arithmetic.
 
 ### 3.2 Reviewer agents (Graph nodes)
 
-Each node is a `strands.Agent` wrapped as a `GraphBuilder` node. Models are tiered (Req 8.2):
+Each node is a `strands.Agent` wrapped as a `GraphBuilder` node. We use the Gemini provider (Req 8.2):
 
 | Node | Model tier | Tools | System prompt focus |
 |---|---|---|---|
-| **Editorial** | Haiku (cheap) | none | grammar, tone, FDA fair-balance/formatting |
-| **Internal Evidence** | Sonnet | `query_s3_documents`, `retrieve` (Bedrock KB) | substantiate vs. private evidence; emit S3+page citation |
-| **External Evidence** | Sonnet | `mcp_client` → PubMed + openFDA | substantiate vs. public lit; emit ID+URL citation |
+| **Editorial** | `gemini-2.5-flash` | none | grammar, exciting travel tone, and FIFA trademark guidelines (Toronto Stadium vs BMO Field) |
+| **Logistics** | `gemini-2.5-flash` | `query_google_drive` | check dates/times against flights, hotels, and tickets; warn on tight connections |
+| **Rules & Schedule** | `gemini-2.5-flash` | `mcp_client` → Web Search | check match schedules, clear-bag policies, and transit routes in Toronto |
 
 ```python
 from strands import Agent
-from strands.models import BedrockModel
+from strands.models import GeminiModel
 from strands.multiagent import GraphBuilder
 
-sonnet = BedrockModel(model_id="global.anthropic.claude-sonnet-4-6", temperature=0.1,
-                      max_tokens=1500, guardrail_id=GUARDRAIL_ID, guardrail_version="DRAFT")
-haiku  = BedrockModel(model_id="global.anthropic.claude-haiku-4-5", temperature=0.0, max_tokens=800)
+# GeminiModel verified against strands_agents==1.42.0 / google-genai==1.75.0.
+# - model_id and params are GeminiConfig keyword args (not top-level constructor params).
+# - temperature/max_output_tokens go INSIDE params={} — they map to Google's GenerationConfig.
+# - API key: set GOOGLE_API_KEY env var (google-genai SDK default); or pass explicitly via
+#   client_args={"api_key": os.environ["GEMINI_API_KEY"]} if you prefer that name.
+gemini_flash = GeminiModel(
+    model_id="gemini-2.5-flash",
+    params={"temperature": 0.1, "max_output_tokens": 1500},
+)
 
-editorial = Agent(model=haiku,  system_prompt=EDITORIAL_PROMPT, hooks=[ReadOnlyGuard()])
-internal  = Agent(model=sonnet, system_prompt=INTERNAL_PROMPT, tools=[query_s3_documents, retrieve],
-                  hooks=[ReadOnlyGuard()])
-external  = Agent(model=sonnet, system_prompt=EXTERNAL_PROMPT, tools=[mcp_pubmed, mcp_openfda],
-                  hooks=[ReadOnlyGuard()])
+editorial      = Agent(model=gemini_flash, system_prompt=EDITORIAL_PROMPT,
+                       hooks=[ReadOnlyGuard()])
+logistics      = Agent(model=gemini_flash, system_prompt=LOGISTICS_PROMPT,
+                       tools=[query_google_drive], hooks=[ReadOnlyGuard()])
+rules_schedule = Agent(model=gemini_flash, system_prompt=RULES_PROMPT,
+                       tools=[mcp_web_search], hooks=[ReadOnlyGuard()])
 
 b = GraphBuilder()
-b.add_node(editorial, "editorial")
-b.add_node(internal,  "internal")
-b.add_node(external,  "external")
-b.add_node(synthesis, "synthesis")
-# No edges among reviewers ⇒ they run in parallel; all converge on synthesis (Req 3.1, 6.1)
-b.add_edge("editorial", "synthesis")
-b.add_edge("internal",  "synthesis")
-b.add_edge("external",  "synthesis")
+b.add_node(editorial,      "editorial")
+b.add_node(logistics,      "logistics")
+b.add_node(rules_schedule, "rules_schedule")
+b.add_node(synthesis,      "synthesis")
+b.add_edge("editorial",      "synthesis")
+b.add_edge("logistics",      "synthesis")
+b.add_edge("rules_schedule", "synthesis")
 graph = b.build()
 ```
 
-> Verify `GraphBuilder`'s exact `add_node`/`add_edge`/entry-point signatures against
-> `.venv/.../strands/multiagent/graph.py` for v1.42 — the shape is as above; confirm parameter names
-> before coding.
-
 ### 3.3 External evidence over MCP
+The `Rules & Schedule` agent utilizes standard web search tools to pull live schedules and official BMO Field guidelines. This ensures that match changes or bag policies are factual and backed by live URL citations.
 
-PubMed/openFDA are reached with the `mcp_client` tool from `strands_agents_tools`, pointed at an MCP
-server. For this lab, that server can run as a local `stdio` process (mirroring `.mcp.json`);
-in production it is a Lambda/Fargate-hosted HTTP MCP server, ideally fronted by **AgentCore Gateway**
-(managed auth, turns the API into MCP tools). The agent never makes raw HTTP from free-text — it calls
-typed MCP tools (`search_pubmed(query)`, `lookup_openfda(ndc)`).
+---
 
 ## 4. Data models
 
@@ -131,114 +123,97 @@ typed MCP tools (`search_pubmed(query)`, `lookup_openfda(ndc)`).
 from typing import Literal, Optional
 from pydantic import BaseModel, HttpUrl
 
-class Claim(BaseModel):
-    claim_id: str
+class ItineraryActivity(BaseModel):
+    activity_id: str
     batch_id: str
-    text: str
+    date: str
+    time: str
+    location: str
+    description: str
     source_page: int
 
 class Citation(BaseModel):
-    kind: Literal["internal_s3", "pubmed", "openfda"]
-    locator: str          # s3://bucket/key#page=3  |  PMID:12345678  |  openFDA set id
-    url: Optional[HttpUrl] # resolvable link where one exists (Req 5.2)
+    kind: Literal["google_drive", "web"]
+    locator: str          # gdrive://bookings/flight_confirm.pdf#page=1  |  URL link
+    url: Optional[HttpUrl] # URL where one exists (Req 5.2)
 
 class Finding(BaseModel):
-    claim_id: str
-    dimension: Literal["editorial", "internal", "external"]
-    verdict: Literal["Substantiated", "Failed Validation", "Needs Human Review"]
+    activity_id: str
+    dimension: Literal["editorial", "logistics", "rules_schedule"]
+    verdict: Literal["Verified", "Logistical Warning", "Policy Conflict", "Needs Human Review"]
     rationale: str
     citations: list[Citation] = []
 
-class ClaimReview(BaseModel):           # produced by synthesis, one per claim
-    claim: Claim
-    final_verdict: Literal["Substantiated", "Failed Validation", "Needs Human Review"]
+class ActivityReview(BaseModel):           # produced by synthesis, one per activity
+    activity: ItineraryActivity
+    final_verdict: Literal["Verified", "Logistical Warning", "Policy Conflict", "Needs Human Review"]
     findings: list[Finding]
 
-class RunReport(BaseModel):
-    reviews: list[ClaimReview]          # Failed Validation sorted first (Req 6.2)
+class TripReport(BaseModel):
+    reviews: list[ActivityReview]       # Policy Conflict & Logistical Warning sorted first (Req 6.2)
     counts: dict[str, int]
     degraded_dimensions: list[str]      # reviewers that errored/timed out (Req 3.5)
     total_tokens: int
 ```
 
-**Synthesis verdict rule (Req 5):** `Failed Validation` if any reviewer found a contradiction;
-else `Substantiated` only if an evidence reviewer attached a resolvable citation; else
-`Needs Human Review`. A `Substantiated` verdict with no citation is a bug, asserted in tests.
+**Synthesis verdict rule (Req 5):** 
+- `Policy Conflict` if the Rules reviewer flags a stadium rule violation.
+- `Logistical Warning` if the Logistics reviewer flags a booking conflict (e.g. flight arrival time overlaps with game time) or missing ticket.
+- `Needs Human Review` if any reviewer errored or was unable to resolve a warning.
+- Otherwise, `Verified` only if the Logistics agent confirms a valid booking exists and the Rules agent confirms BMO Field/match-day details.
 
-> Use `Agent(structured_output_model=Finding)` so reviewers return validated `Finding` objects
-> instead of free text you have to parse — this is built into Strands (Req 5, reliability).
+---
 
 ## 5. Safety boundary (Req 4)
 
-Two independent controls plus IAM (defense in depth):
+We utilize the local application guard for hands-on validation:
 
 ```python
 from strands.hooks import HookProvider, HookRegistry
 from strands.hooks.events import BeforeToolCallEvent
 
 class ReadOnlyGuard(HookProvider):
-    BLOCKED = ("write", "delete", "update", "put_", "create", "drop", "remove")
+    BLOCKED = ("write", "delete", "update", "put_", "create", "drop", "remove", "cancel")
     def register_hooks(self, registry: HookRegistry) -> None:
         registry.add_callback(BeforeToolCallEvent, self._enforce)
     def _enforce(self, event: BeforeToolCallEvent) -> None:
         name = event.tool_use["name"].lower()
         if any(v in name for v in self.BLOCKED):
-            event.cancel_tool = f"DENIED: '{name}' is a write op; MLR review is read-only."
-            # cancel_tool returns a clean tool-result to the model (Req 4.2) and is captured
-            # as an audit span (Req 7.3). We do NOT raise — that would kill the whole run.
+            event.cancel_tool = f"DENIED: '{name}' is a mutating operation; itinerary review is read-only."
 ```
 
-1. **Application guard:** `ReadOnlyGuard` on every agent (above).
-2. **Model guard:** Bedrock Guardrails via `BedrockModel(guardrail_id=...)` — PII redaction +
-   prompt-injection filtering (Req 4.4).
-3. **Infra guard:** the tool compute's IAM role is read-only (`s3:GetObject`, no `PutObject`); even
-   if both software guards failed, the blast radius is read-only (Req 4.3).
+---
 
 ## 6. Observability (Req 7)
 
+We setup console telemetry:
 ```python
 from strands.telemetry import StrandsTelemetry
-StrandsTelemetry().setup_otlp_exporter()   # OTEL_EXPORTER_OTLP_ENDPOINT → AgentCore Obs / CloudWatch
+StrandsTelemetry().setup_console_exporter()
 ```
+Strands auto-emits stdout logs with trace details. The `ReadOnlyGuard` denial path prints structured log statements containing `activity_id` and `batch_id` to trace safety violations.
 
-Strands auto-emits spans for the loop, model calls, and tool calls. We add a custom span in the
-`ReadOnlyGuard` denial path and attach `claim_id`/`batch_id` via `trace_attributes` so audit queries
-can pivot on a claim.
+---
 
 ## 7. Error handling
 
 | Failure | Detection | Behavior | Req |
 |---|---|---|---|
 | Unreadable PDF | `process_pdf` raises `IngestionError` | abort before any review; typed error names the file | 1.3 |
-| Zero claims after segmentation | `batch_content` returns empty | terminate "no reviewable content" | 2.3 |
+| Zero activities after segmentation | `batch_content` returns empty | terminate "no reviewable itinerary activities" | 2.3 |
 | One reviewer errors/timeouts | Graph node failure | continue others; mark that dimension `Needs Human Review` | 3.5 |
-| Bedrock 429 throttling | model call error | exp. backoff + jitter, capped; then degrade dimension | 8.4 |
-| Write tool attempted | `ReadOnlyGuard` | `cancel_tool` + audit span; run continues | 4.2, 7.3 |
-| `Substantiated` w/o citation | synthesis invariant | downgrade to `Needs Human Review`; log a bug metric | 5.5 |
+| Gemini 429 throttling | model call error | exp. backoff + jitter, capped; then degrade dimension | 8.4 |
+| Mutating tool attempted | `ReadOnlyGuard` | `cancel_tool` + log output; run continues | 4.2, 7.3 |
+| `Verified` w/o citation | synthesis invariant | downgrade to `Needs Human Review` | 5.5 |
+
+---
 
 ## 8. Testing strategy
 
-- **Unit (deterministic, no LLM):** `process_pdf` on good/encrypted/non-PDF fixtures (Req 1);
-  `batch_content` token-ceiling + claim-id stability + empty-input path (Req 2); synthesis verdict
-  rule as a pure function over `Finding` lists (Req 5) — table-driven, no model calls.
-- **Safety (no LLM):** call `ReadOnlyGuard._enforce` with a synthetic `BeforeToolCallEvent` for each
-  blocked verb; assert `cancel_tool` is set and an audit span is emitted (Req 4, 7.3).
-- **Integration (mocked model):** swap `BedrockModel` for `OllamaModel`/`LiteLLMModel` or a stub so
-  the Graph topology, parallel fan-out, and degraded-dimension path run offline (Req 3.5).
-- **Eval harness:** a golden set of claim→expected-verdict pairs scored by an independent
-  LLM-as-judge. (There is no verified "Strands Evals" package — build this harness or use Bedrock
-  model evaluation; do not name a library that doesn't exist.)
-- **Invariant test:** assert no `Substantiated` verdict ever lacks a resolvable citation (Req 5.5).
-
-## 9. Requirements traceability
-
-| Requirement | Realized by |
-|---|---|
-| 1 Ingestion/OCR | `process_pdf` (§3.1), error table (§7) |
-| 2 Batching | `batch_content` (§3.1), `Claim`/`Batch` models (§4) |
-| 3 Parallel reviews | `GraphBuilder` topology (§2, §3.2), degraded-dimension handling (§7) |
-| 4 Read-only boundary | `ReadOnlyGuard` + Guardrails + IAM (§5) |
-| 5 Citations/verdicts | data models + synthesis rule (§4), invariant test (§8) |
-| 6 Synthesis/report | synthesis node + `RunReport` (§3.2, §4) |
-| 7 Observability | `StrandsTelemetry` + audit span (§6) |
-| 8 Perf/cost | model tiering (§3.2), `max_tokens`, backoff (§7) |
+- **Unit:** 
+  - `process_pdf` on good/corrupt PDFs.
+  - `batch_content` activity parsing and stable ID generation.
+  - Synthesis rules: testing multiple combinations of `Logistical Warning` and `Policy Conflict` inputs.
+- **Safety:** Assert `ReadOnlyGuard._enforce` intercepts block-listed tool calls.
+- **Integration:** Running the Graph with stubbed Gemini models and verifying the parallel execution of Editorial, Logistics, and Rules & Schedule nodes.
+- **Mock Google Drive:** Setup test fixtures (mock PDF/JSON files) representing flight details (YYZ landing times), hotel check-ins, and match tickets for Toronto Stadium (BMO Field).

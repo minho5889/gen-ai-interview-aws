@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Helper to start an MLR MCP server locally for testing/debugging over stdio.
+# Helper to start an MCP server locally for testing/debugging over stdio.
 # Claude Code launches these automatically from .mcp.json; this is for manual CLI debugging.
 
 WORKSPACE_PATH="/Users/minholee/Projects/gen-ai-interview"

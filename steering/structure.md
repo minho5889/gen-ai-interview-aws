@@ -3,11 +3,11 @@
 ## 1. Repository layout
 
 ```
-gen-ai-interview/                # (the MLR project)
+gen-ai-interview/                # (World Cup 2026 Toronto Verifier)
 ├── CLAUDE.md                    # always-on context for Claude Code; @imports steering/*
 ├── steering/                    # product.md, tech.md, structure.md
 ├── spec/                        # requirements.md → design.md → tasks.md (source of truth)
-├── src/mlr/                     # implementation
+├── src/verifier/                # implementation
 ├── tests/                       # tests
 ├── .mcp.json                    # local MCP servers (fetch, filesystem)
 ├── start-mcp.sh                 # manual MCP launcher (debugging)

@@ -1,0 +1,21 @@
+# Python virtual environment (251 MB — never commit)
+.venv/
+
+# Archived material: personal data + AWS customer names. Intentionally NOT published.
+archive/
+
+# Python caches / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# OS / editor cruft
+.DS_Store
+
+# Claude Code machine-local settings
+.claude/settings.local.json
